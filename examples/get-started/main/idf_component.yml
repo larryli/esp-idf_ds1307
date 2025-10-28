@@ -1,0 +1,6 @@
+description: 'Get started for DS1307 display driver'
+dependencies:
+  idf: '>=5.0'
+  larryli/ds1307:
+    version: '*'
+    override_path: '../../../'
