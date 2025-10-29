@@ -3,4 +3,4 @@ url: https://github.com/larryli/esp-idf_ds1307
 repository: https://github.com/larryli/esp-idf_ds1307.git
 license: 'MIT'
 dependencies:
-  idf: '>=5.3'
+  idf: '>=5.2'

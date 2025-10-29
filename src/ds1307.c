@@ -2,6 +2,7 @@
 #include "driver/i2c_master.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include <string.h>
 
 /***
  * Addr | Bit7 | 6     | 5     | 4        | 3 | 2 | 1   | 0   | Func    | Range
