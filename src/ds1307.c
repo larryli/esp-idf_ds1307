@@ -160,7 +160,7 @@ esp_err_t ds1307_get_datetime(ds1307_handle_t ds1307_handle, struct tm *tm)
     }
     tm->tm_wday = bcd2int(buf[DAY_OFFSET]) - 1;
     tm->tm_mday = bcd2int(buf[DATE_OFFSET]);
-    tm->tm_mon = bcd2int(buf[MON_OFFSET]);
+    tm->tm_mon = bcd2int(buf[MON_OFFSET]) - 1;
     tm->tm_year = bcd2int(buf[YEAR_OFFSET]) + ds1307_handle->tm_year_start;
     return ESP_OK;
 }
