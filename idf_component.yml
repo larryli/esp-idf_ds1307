@@ -1,6 +1,8 @@
 description: DS1307 real-time clock(RTC) driver component
 url: https://github.com/larryli/esp-idf_ds1307
 repository: https://github.com/larryli/esp-idf_ds1307.git
+documentation: https://github.com/larryli/esp-idf_ds1307
+issues: https://github.com/larryli/esp-idf_ds1307/issues
 license: 'MIT'
 dependencies:
   idf: '>=5.2'
