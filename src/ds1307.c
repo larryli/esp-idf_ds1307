@@ -1,7 +1,8 @@
 #include "ds1307.h"
-#include "driver/i2c_master.h"
+#include "driver/i2c.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
 #include <string.h>
 
 /***
@@ -50,6 +51,8 @@
 #define CTRL_RS_MASK 0x3
 #define RAM_REG 8
 
+#define I2C_TIMEOUT pdMS_TO_TICKS(1000)
+
 static const char TAG[] = "ds1307";
 
 static uint8_t int2bcd(uint8_t x) { return ((x / 10) << 4) + (x % 10); }
@@ -57,18 +60,75 @@ static uint8_t int2bcd(uint8_t x) { return ((x / 10) << 4) + (x % 10); }
 static uint8_t bcd2int(uint8_t x) { return (x >> 4) * 10 + (x & 0x0f); }
 
 struct ds1307_t {
-    i2c_master_dev_handle_t i2c_dev; /*!< I2C device handle */
+    i2c_port_t i2c_port; /*!< I2C port number */
+    uint8_t addr;        /*!< I2C device address */
     int tm_year_start;
 };
 
-esp_err_t ds1307_init(i2c_master_bus_handle_t bus_handle,
-                      const ds1307_config_t *ds1307_config,
+/**
+ * @brief Write one or more bytes to a DS1307 register (register address first)
+ */
+static esp_err_t i2c_write_reg(ds1307_handle_t ds1307_handle, uint8_t reg,
+                               const uint8_t *data, size_t len)
+{
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (ds1307_handle->addr << 1) | I2C_MASTER_WRITE,
+                          true);
+    i2c_master_write_byte(cmd, reg, true);
+    if (len > 0) {
+        i2c_master_write(cmd, (uint8_t *)data, len, true);
+    }
+    i2c_master_stop(cmd);
+    esp_err_t ret =
+        i2c_master_cmd_begin(ds1307_handle->i2c_port, cmd, I2C_TIMEOUT);
+    i2c_cmd_link_delete(cmd);
+    return ret;
+}
+
+/**
+ * @brief Read one or more bytes from a DS1307 register.
+ *
+ * Implemented as two separate I2C transactions (write register address + STOP,
+ * then a fresh START + read), matching the ESP8266_RTOS_SDK i2c example. The
+ * DS1307 latches the register pointer across the STOP, so this works reliably.
+ */
+static esp_err_t i2c_read_reg(ds1307_handle_t ds1307_handle, uint8_t reg,
+                              uint8_t *data, size_t len)
+{
+    // Phase 1: write the register address (DS1307 latches the pointer)
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (ds1307_handle->addr << 1) | I2C_MASTER_WRITE,
+                          true);
+    i2c_master_write_byte(cmd, reg, true);
+    i2c_master_stop(cmd);
+    esp_err_t ret =
+        i2c_master_cmd_begin(ds1307_handle->i2c_port, cmd, I2C_TIMEOUT);
+    i2c_cmd_link_delete(cmd);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    // Phase 2: read len bytes from the addressed register
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (ds1307_handle->addr << 1) | I2C_MASTER_READ,
+                          true);
+    i2c_master_read(cmd, data, len, I2C_MASTER_LAST_NACK);
+    i2c_master_stop(cmd);
+    ret = i2c_master_cmd_begin(ds1307_handle->i2c_port, cmd, I2C_TIMEOUT);
+    i2c_cmd_link_delete(cmd);
+    return ret;
+}
+
+esp_err_t ds1307_init(const ds1307_config_t *ds1307_config,
                       ds1307_handle_t *ds1307_handle)
 {
-    ESP_RETURN_ON_FALSE(bus_handle, ESP_ERR_INVALID_ARG, TAG,
-                        "invalid i2c master bus");
     ESP_RETURN_ON_FALSE(ds1307_config, ESP_ERR_INVALID_ARG, TAG,
                         "invalid ds1307 config");
+    ESP_RETURN_ON_FALSE(ds1307_handle, ESP_ERR_INVALID_ARG, TAG,
+                        "invalid ds1307 handle");
     esp_err_t ret = ESP_OK;
     ds1307_handle_t out_handle =
         (ds1307_handle_t)calloc(1, sizeof(struct ds1307_t));
@@ -81,25 +141,14 @@ esp_err_t ds1307_init(i2c_master_bus_handle_t bus_handle,
         century++;
     }
     out_handle->tm_year_start = (century - 20) * 100;
-
-    i2c_device_config_t i2c_dev_conf = {
-        .scl_speed_hz = ds1307_config->ds1307_device.scl_speed_hz,
-        .device_address = ds1307_config->ds1307_device.device_address,
-    };
-    if (out_handle->i2c_dev == NULL) {
-        ESP_GOTO_ON_ERROR(i2c_master_bus_add_device(bus_handle, &i2c_dev_conf,
-                                                    &out_handle->i2c_dev),
-                          err, TAG, "i2c new bus failed");
-    }
+    out_handle->i2c_port = ds1307_config->i2c_port;
+    out_handle->addr = ds1307_config->device_address;
 
     *ds1307_handle = out_handle;
 
     return ESP_OK;
 
 err:
-    if (out_handle && out_handle->i2c_dev) {
-        i2c_master_bus_rm_device(out_handle->i2c_dev);
-    }
     free(out_handle);
     return ret;
 }
@@ -108,8 +157,6 @@ esp_err_t ds1307_deinit(ds1307_handle_t ds1307_handle)
 {
     ESP_RETURN_ON_FALSE(ds1307_handle, ESP_ERR_NO_MEM, TAG,
                         "invalid ds1307 handle");
-    ESP_RETURN_ON_ERROR(i2c_master_bus_rm_device(ds1307_handle->i2c_dev), TAG,
-                        "rm i2c device failed");
     free(ds1307_handle);
     return ESP_OK;
 }
@@ -145,10 +192,8 @@ esp_err_t ds1307_get_datetime(ds1307_handle_t ds1307_handle, struct tm *tm)
                         "invalid ds1307 handle");
     ESP_RETURN_ON_FALSE(tm, ESP_ERR_NO_MEM, TAG, "invalid datetime handle");
 
-    uint8_t reg = SEC_REG, buf[BUF_SIZE];
-    ESP_RETURN_ON_ERROR(i2c_master_transmit_receive(ds1307_handle->i2c_dev,
-                                                    &reg, sizeof(reg), buf,
-                                                    sizeof(buf), -1),
+    uint8_t buf[BUF_SIZE];
+    ESP_RETURN_ON_ERROR(i2c_read_reg(ds1307_handle, SEC_REG, buf, sizeof(buf)),
                         TAG, "i2c read failed");
     memset(tm, 0, sizeof(struct tm));
     tm->tm_sec = bcd2int(buf[SEC_OFFSET] & SEC_MASK);
@@ -172,33 +217,30 @@ esp_err_t ds1307_set_datetime(ds1307_handle_t ds1307_handle,
                         "invalid ds1307 handle");
     ESP_RETURN_ON_FALSE(tm, ESP_ERR_NO_MEM, TAG, "invalid datetime handle");
 
-    uint8_t reg = SEC_REG, buf[BUF_SIZE + 1];
-    ESP_RETURN_ON_ERROR(i2c_master_transmit_receive(ds1307_handle->i2c_dev,
-                                                    &reg, sizeof(reg), buf,
-                                                    BUF_HOUR_SIZE, -1),
+    uint8_t buf[BUF_HOUR_SIZE];
+    ESP_RETURN_ON_ERROR(i2c_read_reg(ds1307_handle, SEC_REG, buf, sizeof(buf)),
                         TAG, "i2c read failed");
     uint8_t ch = buf[SEC_OFFSET] & SEC_CH_BIT;
     uint8_t hour_12 = buf[HOUR_OFFSET] & HOUR_12_BIT;
 
-    buf[0] = reg;
-    buf[SEC_OFFSET + 1] = (int2bcd(tm->tm_sec) & SEC_MASK) | ch;
-    buf[MIN_OFFSET + 1] = int2bcd(tm->tm_min);
+    uint8_t out[BUF_SIZE];
+    out[SEC_OFFSET] = (int2bcd(tm->tm_sec) & SEC_MASK) | ch;
+    out[MIN_OFFSET] = int2bcd(tm->tm_min);
     if (hour_12) { // 12-Hour
-        buf[HOUR_OFFSET + 1] = to_12_hour(tm->tm_hour);
+        out[HOUR_OFFSET] = to_12_hour(tm->tm_hour);
     } else { // 24-Hour
-        buf[HOUR_OFFSET + 1] = int2bcd(tm->tm_hour);
+        out[HOUR_OFFSET] = int2bcd(tm->tm_hour);
     }
-    buf[DAY_OFFSET + 1] = int2bcd(tm->tm_wday + 1);
-    buf[DATE_OFFSET + 1] = int2bcd(tm->tm_mday);
-    buf[MON_OFFSET + 1] = int2bcd(tm->tm_mon + 1);
+    out[DAY_OFFSET] = int2bcd(tm->tm_wday + 1);
+    out[DATE_OFFSET] = int2bcd(tm->tm_mday);
+    out[MON_OFFSET] = int2bcd(tm->tm_mon + 1);
     int year = tm->tm_year % 100;
     if (year < 0) {
         year += 100;
     }
-    buf[YEAR_OFFSET + 1] = int2bcd(year);
-    ESP_RETURN_ON_ERROR(
-        i2c_master_transmit(ds1307_handle->i2c_dev, buf, sizeof(buf), -1), TAG,
-        "i2c write failed");
+    out[YEAR_OFFSET] = int2bcd(year);
+    ESP_RETURN_ON_ERROR(i2c_write_reg(ds1307_handle, SEC_REG, out, sizeof(out)),
+                        TAG, "i2c write failed");
 
     return ESP_OK;
 }
@@ -209,10 +251,8 @@ esp_err_t ds1307_get_data(ds1307_handle_t ds1307_handle, ds1307_data_t *data)
                         "invalid ds1307 handle");
     ESP_RETURN_ON_FALSE(data, ESP_ERR_NO_MEM, TAG, "invalid data handle");
 
-    uint8_t reg = SEC_REG, buf[BUF_SIZE];
-    ESP_RETURN_ON_ERROR(i2c_master_transmit_receive(ds1307_handle->i2c_dev,
-                                                    &reg, sizeof(reg), buf,
-                                                    sizeof(buf), -1),
+    uint8_t buf[BUF_SIZE];
+    ESP_RETURN_ON_ERROR(i2c_read_reg(ds1307_handle, SEC_REG, buf, sizeof(buf)),
                         TAG, "i2c read failed");
     memset(data, 0, sizeof(ds1307_data_t));
     data->second = buf[SEC_OFFSET] & SEC_MASK;
@@ -238,29 +278,26 @@ esp_err_t ds1307_set_data(ds1307_handle_t ds1307_handle,
                         "invalid ds1307 handle");
     ESP_RETURN_ON_FALSE(data, ESP_ERR_NO_MEM, TAG, "invalid data handle");
 
-    uint8_t reg = SEC_REG, buf[BUF_SIZE + 1];
-    ESP_RETURN_ON_ERROR(i2c_master_transmit_receive(ds1307_handle->i2c_dev,
-                                                    &reg, sizeof(reg), buf, 1,
-                                                    -1),
-                        TAG, "i2c read failed");
-    uint8_t ch = buf[SEC_OFFSET] & SEC_CH_BIT;
+    uint8_t ch;
+    ESP_RETURN_ON_ERROR(i2c_read_reg(ds1307_handle, SEC_REG, &ch, 1), TAG,
+                        "i2c read failed");
+    ch &= SEC_CH_BIT;
 
-    buf[0] = reg;
-    buf[SEC_OFFSET + 1] = (data->second & SEC_MASK) | ch;
-    buf[MIN_OFFSET + 1] = data->minute & 0x7f;
+    uint8_t out[BUF_SIZE];
+    out[SEC_OFFSET] = (data->second & SEC_MASK) | ch;
+    out[MIN_OFFSET] = data->minute & 0x7f;
     if (data->hour_12) { // 12-Hour
-        buf[HOUR_OFFSET + 1] = (data->hour & HOUR_12_MASK) | HOUR_12_BIT |
-                               (data->hour_pm ? HOUR_PM_BIT : 0);
+        out[HOUR_OFFSET] = (data->hour & HOUR_12_MASK) | HOUR_12_BIT |
+                           (data->hour_pm ? HOUR_PM_BIT : 0);
     } else { // 24-Hour
-        buf[HOUR_OFFSET + 1] = data->hour & 0x3f;
+        out[HOUR_OFFSET] = data->hour & 0x3f;
     }
-    buf[DAY_OFFSET + 1] = data->day & 0x07;
-    buf[DATE_OFFSET + 1] = data->date & 0x3f;
-    buf[MON_OFFSET + 1] = data->month & 0x1f;
-    buf[YEAR_OFFSET + 1] = data->year;
-    ESP_RETURN_ON_ERROR(
-        i2c_master_transmit(ds1307_handle->i2c_dev, buf, sizeof(buf), -1), TAG,
-        "i2c write failed");
+    out[DAY_OFFSET] = data->day & 0x07;
+    out[DATE_OFFSET] = data->date & 0x3f;
+    out[MON_OFFSET] = data->month & 0x1f;
+    out[YEAR_OFFSET] = data->year;
+    ESP_RETURN_ON_ERROR(i2c_write_reg(ds1307_handle, SEC_REG, out, sizeof(out)),
+                        TAG, "i2c write failed");
 
     return ESP_OK;
 }
@@ -271,11 +308,10 @@ esp_err_t ds1307_get_12_hour(ds1307_handle_t ds1307_handle, bool *mode)
                         "invalid ds1307 handle");
     ESP_RETURN_ON_FALSE(mode, ESP_ERR_NO_MEM, TAG, "invalid mode handle");
 
-    uint8_t reg = SEC_REG + HOUR_OFFSET, value;
-    ESP_RETURN_ON_ERROR(i2c_master_transmit_receive(ds1307_handle->i2c_dev,
-                                                    &reg, sizeof(reg), &value,
-                                                    sizeof(value), -1),
-                        TAG, "i2c read failed");
+    uint8_t value;
+    ESP_RETURN_ON_ERROR(
+        i2c_read_reg(ds1307_handle, SEC_REG + HOUR_OFFSET, &value, 1), TAG,
+        "i2c read failed");
     *mode = (value & HOUR_12_BIT) ? true : false;
     return ESP_OK;
 }
@@ -285,11 +321,10 @@ esp_err_t ds1307_set_12_hour(ds1307_handle_t ds1307_handle, const bool mode)
     ESP_RETURN_ON_FALSE(ds1307_handle, ESP_ERR_NO_MEM, TAG,
                         "invalid ds1307 handle");
 
-    uint8_t reg = SEC_REG + HOUR_OFFSET, hour;
-    ESP_RETURN_ON_ERROR(i2c_master_transmit_receive(ds1307_handle->i2c_dev,
-                                                    &reg, sizeof(reg), &hour,
-                                                    sizeof(hour), -1),
-                        TAG, "i2c read failed");
+    uint8_t hour;
+    ESP_RETURN_ON_ERROR(
+        i2c_read_reg(ds1307_handle, SEC_REG + HOUR_OFFSET, &hour, 1), TAG,
+        "i2c read failed");
     if ((hour & HOUR_12_BIT) == (mode ? HOUR_12_BIT : 0)) {
         return ESP_OK;
     }
@@ -298,9 +333,8 @@ esp_err_t ds1307_set_12_hour(ds1307_handle_t ds1307_handle, const bool mode)
     } else { // 12-Hour -=> 24-Hour
         hour = int2bcd(from_12_hour(hour));
     }
-    uint8_t buf[2] = {reg, hour};
     ESP_RETURN_ON_ERROR(
-        i2c_master_transmit(ds1307_handle->i2c_dev, buf, sizeof(buf), -1), TAG,
+        i2c_write_reg(ds1307_handle, SEC_REG + HOUR_OFFSET, &hour, 1), TAG,
         "i2c write failed");
     return ESP_OK;
 }
@@ -312,19 +346,14 @@ static esp_err_t set_reg(ds1307_handle_t ds1307_handle, uint8_t reg,
                         "invalid ds1307 handle");
 
     uint8_t origin;
-    ESP_RETURN_ON_ERROR(i2c_master_transmit_receive(ds1307_handle->i2c_dev,
-                                                    &reg, sizeof(reg), &origin,
-                                                    sizeof(origin), -1),
-                        TAG, "i2c read failed");
+    ESP_RETURN_ON_ERROR(i2c_read_reg(ds1307_handle, reg, &origin, 1), TAG,
+                        "i2c read failed");
     if ((origin & (~mask)) == value) {
         return ESP_OK;
     }
 
-    uint8_t buf[2] = {reg, (origin & mask) | value};
-    ESP_RETURN_ON_ERROR(
-        i2c_master_transmit(ds1307_handle->i2c_dev, buf, sizeof(buf), -1), TAG,
-        "i2c write failed");
-    return ESP_OK;
+    uint8_t newval = (origin & mask) | value;
+    return i2c_write_reg(ds1307_handle, reg, &newval, 1);
 }
 
 esp_err_t ds1307_get_halt(ds1307_handle_t ds1307_handle, bool *halt)
@@ -333,11 +362,9 @@ esp_err_t ds1307_get_halt(ds1307_handle_t ds1307_handle, bool *halt)
                         "invalid ds1307 handle");
     ESP_RETURN_ON_FALSE(halt, ESP_ERR_NO_MEM, TAG, "invalid halt handle");
 
-    uint8_t reg = SEC_REG, value;
-    ESP_RETURN_ON_ERROR(i2c_master_transmit_receive(ds1307_handle->i2c_dev,
-                                                    &reg, sizeof(reg), &value,
-                                                    sizeof(value), -1),
-                        TAG, "i2c read failed");
+    uint8_t value;
+    ESP_RETURN_ON_ERROR(i2c_read_reg(ds1307_handle, SEC_REG, &value, 1), TAG,
+                        "i2c read failed");
     *halt = (value & SEC_CH_BIT) ? true : false;
     return ESP_OK;
 }
@@ -354,11 +381,9 @@ esp_err_t ds1307_get_output(ds1307_handle_t ds1307_handle, bool *output)
                         "invalid ds1307 handle");
     ESP_RETURN_ON_FALSE(output, ESP_ERR_NO_MEM, TAG, "invalid output handle");
 
-    uint8_t reg = CTRL_REG, value;
-    ESP_RETURN_ON_ERROR(i2c_master_transmit_receive(ds1307_handle->i2c_dev,
-                                                    &reg, sizeof(reg), &value,
-                                                    sizeof(value), -1),
-                        TAG, "i2c read failed");
+    uint8_t value;
+    ESP_RETURN_ON_ERROR(i2c_read_reg(ds1307_handle, CTRL_REG, &value, 1), TAG,
+                        "i2c read failed");
     *output = (value & CTRL_OUT_BIT) ? true : false;
     return ESP_OK;
 }
@@ -376,11 +401,9 @@ esp_err_t ds1307_get_square_wave_enable(ds1307_handle_t ds1307_handle,
                         "invalid ds1307 handle");
     ESP_RETURN_ON_FALSE(enable, ESP_ERR_NO_MEM, TAG, "invalid enable handle");
 
-    uint8_t reg = CTRL_REG, value;
-    ESP_RETURN_ON_ERROR(i2c_master_transmit_receive(ds1307_handle->i2c_dev,
-                                                    &reg, sizeof(reg), &value,
-                                                    sizeof(value), -1),
-                        TAG, "i2c read failed");
+    uint8_t value;
+    ESP_RETURN_ON_ERROR(i2c_read_reg(ds1307_handle, CTRL_REG, &value, 1), TAG,
+                        "i2c read failed");
     *enable = (value & CTRL_SQWE_BIT) ? true : false;
     return ESP_OK;
 }
@@ -399,11 +422,9 @@ esp_err_t ds1307_get_rate_select(ds1307_handle_t ds1307_handle,
                         "invalid ds1307 handle");
     ESP_RETURN_ON_FALSE(rs, ESP_ERR_NO_MEM, TAG, "invalid rate_select handle");
 
-    uint8_t reg = CTRL_REG, value;
-    ESP_RETURN_ON_ERROR(i2c_master_transmit_receive(ds1307_handle->i2c_dev,
-                                                    &reg, sizeof(reg), &value,
-                                                    sizeof(value), -1),
-                        TAG, "i2c read failed");
+    uint8_t value;
+    ESP_RETURN_ON_ERROR(i2c_read_reg(ds1307_handle, CTRL_REG, &value, 1), TAG,
+                        "i2c read failed");
     *rs = value & CTRL_RS_MASK;
     return ESP_OK;
 }
@@ -423,11 +444,9 @@ esp_err_t ds1307_get_ram(ds1307_handle_t ds1307_handle, uint8_t offset,
     ESP_RETURN_ON_FALSE(offset + size <= DS1307_RAM_SIZE, ESP_ERR_INVALID_ARG,
                         TAG, "invalid offset or size");
 
-    offset += RAM_REG;
-    ESP_RETURN_ON_ERROR(i2c_master_transmit_receive(ds1307_handle->i2c_dev,
-                                                    &offset, sizeof(offset),
-                                                    data, size, -1),
-                        TAG, "i2c read failed");
+    uint8_t reg = offset + RAM_REG;
+    ESP_RETURN_ON_ERROR(i2c_read_reg(ds1307_handle, reg, data, size), TAG,
+                        "i2c read failed");
     return ESP_OK;
 }
 
@@ -440,11 +459,8 @@ esp_err_t ds1307_set_ram(ds1307_handle_t ds1307_handle, uint8_t offset,
     ESP_RETURN_ON_FALSE(offset + size <= DS1307_RAM_SIZE, ESP_ERR_INVALID_ARG,
                         TAG, "invalid offset or size");
 
-    uint8_t buf[DS1307_RAM_SIZE + 1];
-    buf[0] = offset + RAM_REG;
-    memcpy(buf + 1, data, size);
-    ESP_RETURN_ON_ERROR(
-        i2c_master_transmit(ds1307_handle->i2c_dev, buf, size + 1, -1), TAG,
-        "i2c write failed");
+    uint8_t reg = offset + RAM_REG;
+    ESP_RETURN_ON_ERROR(i2c_write_reg(ds1307_handle, reg, data, size), TAG,
+                        "i2c write failed");
     return ESP_OK;
 }

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "driver/i2c_master.h"
+#include "driver/i2c.h"
 #include "esp_err.h"
 #include <time.h>
 
@@ -46,8 +46,9 @@ extern "C" {
 #endif
 
 typedef struct {
-    i2c_device_config_t ds1307_device; /*!< Configuration for ds1307 device */
-    int century;                       /*!< Century 21 is 20xx */
+    i2c_port_t i2c_port;       /*!< I2C port number (e.g. I2C_NUM_0) */
+    uint8_t device_address;    /*!< I2C device address (e.g. DS1307_ADDRESS) */
+    int century;               /*!< Century 21 is 20xx */
 } ds1307_config_t;
 
 typedef struct ds1307_t *ds1307_handle_t;
@@ -56,22 +57,20 @@ typedef struct ds1307_t *ds1307_handle_t;
  * @brief Initialize a DS1307 device handle
  *
  * This function allocates and returns a device handle that encapsulates I2C
- * device information for subsequent operations.
+ * device information for subsequent operations. The I2C master port must be
+ * installed and configured (i2c_driver_install / i2c_param_config) by the
+ * caller before calling this function.
  *
- * @param[in] bus_handle I2C master bus handle (i2c_master_bus_handle_t)
  * @param[in] ds1307_config Pointer to ds1307_config_t to configure device
- *                         address/speed and century handling
+ *                         address/port and century handling
  * @param[out] ds1307_handle Returned device handle. The caller must call
  *                          ds1307_deinit when the handle is no longer needed.
  * @return
  *      - ESP_OK: Initialization succeeded
- *      - ESP_ERR_INVALID_ARG: Invalid argument (e.g. NULL bus_handle or
- * ds1307_config)
+ *      - ESP_ERR_INVALID_ARG: Invalid argument (e.g. NULL ds1307_config)
  *      - ESP_ERR_NO_MEM: Memory allocation failed
- *      - Other error codes returned by underlying I2C operations
  */
-esp_err_t ds1307_init(i2c_master_bus_handle_t bus_handle,
-                      const ds1307_config_t *ds1307_config,
+esp_err_t ds1307_init(const ds1307_config_t *ds1307_config,
                       ds1307_handle_t *ds1307_handle);
 
 /**

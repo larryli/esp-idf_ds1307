@@ -1,6 +1,0 @@
-description: 'Get started for DS1307 real-time clock(RTC) driver'
-dependencies:
-  idf: '>=5.2'
-  larryli/ds1307:
-    version: '*'
-    override_path: '../../../'
